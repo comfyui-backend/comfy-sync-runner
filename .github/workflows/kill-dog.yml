@@ -1,0 +1,144 @@
+name: kill-dog-sweep
+
+# L2 — cloud-side GPU pod kill watchdog (wave-13 adhoc-2; see RUNBOOK
+# §Kill-dog in the private repo). Every 10 min: check out the private
+# repo (PAT), run `python3 scripts/kill_dog.py sweep --remote`. If the
+# kill-dog gist is ARMED and its heartbeat is STALE (owner dead) or a
+# pod breached the TTL, terminate the pod(s) via the RunPod API and
+# record the kill as a gist comment (append-only audit).
+#
+# This PUBLIC repo is compute-only; kill-dog logic lives in the private
+# repo so there is exactly ONE implementation (L1 daemon + L2 sweep).
+# Secrets: GH_PAT, RUNPOD_API_KEY, KILLDOG_GIST_ID — never echoed;
+# GitHub auto-redacts registered values from these public logs.
+
+on:
+  schedule:
+    # Every 10 minutes at :04/:14/... — off the :00/:05 congestion.
+    - cron: '4-54/10 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Log-only sweep (no terminate calls)'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+
+permissions: {}
+# No pull_request trigger — fork PRs can never access secrets.
+
+concurrency:
+  group: kill-dog
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    name: Remote kill-dog sweep
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check configuration
+        env:
+          HAS_PAT: ${{ secrets.GH_PAT != '' }}
+          HAS_KEY: ${{ secrets.RUNPOD_API_KEY != '' }}
+          HAS_GIST: ${{ secrets.KILLDOG_GIST_ID != '' }}
+        run: |
+          if [ "$HAS_PAT" != "true" ] || [ "$HAS_KEY" != "true" ] || [ "$HAS_GIST" != "true" ]; then
+            echo "::error::Required secrets missing (GH_PAT / RUNPOD_API_KEY / KILLDOG_GIST_ID)."
+            exit 1
+          fi
+
+      - name: Check out private backend repo
+        uses: actions/checkout@v4
+        with:
+          repository: beulahkemp/comfyui_backend
+          token: ${{ secrets.GH_PAT }}
+          path: backend
+
+      - name: Install Python deps (requests for the RunPod client)
+        run: |
+          python3 -m pip install --user -r backend/requirements.txt
+
+      - name: Sweep (remote — owner-dead rule + TTL backup)
+        working-directory: backend
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          GITHUB_PAT: ${{ secrets.GH_PAT }}
+          KILLDOG_GIST_ID: ${{ secrets.KILLDOG_GIST_ID }}
+          KILLDOG_DRY_RUN: ${{ inputs.dry_run == 'true' && '1' || '0' }}
+        run: |
+          python3 scripts/kill_dog.py sweep --remote
+
+      - name: "Alert on failure (gist comment, 6h-deduped)"
+        # Wave-17 audit E-02: kill-dog is the GPU spend watchdog — a silent
+        # death means orphaned pods bill unbounded. Same pattern as sync.yml's
+        # alert step: append-only gist comment, deduped 6h, best-effort.
+        if: ${{ failure() }}
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GIST_ID: ${{ secrets.KILLDOG_GIST_ID }}
+          ALERT_MARKER: "[alert:kill-dog]"
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python3 - << 'ALERTEOF'
+          import datetime
+          import json
+          import os
+          import sys
+          import urllib.request
+
+          pat = os.environ["GH_PAT"]
+          gist = os.environ["GIST_ID"]
+          marker = os.environ["ALERT_MARKER"]
+          run_url = os.environ["RUN_URL"]
+          DEDUPE_H = 6
+
+          def api(url, data=None):
+              req = urllib.request.Request(
+                  url,
+                  headers={"Authorization": f"token {pat}", "User-Agent": "killdog-alert"},
+                  data=json.dumps(data).encode() if data is not None else None,
+              )
+              with urllib.request.urlopen(req, timeout=20) as r:
+                  return json.loads(r.read().decode() or "{}")
+
+          try:
+              comments = api(f"https://api.github.com/gists/{gist}/comments?per_page=10")
+          except Exception as e:
+              print(f"::warning::alert step could not read gist comments: {e}")
+              sys.exit(0)
+
+          # Wave-17 verify round1: gist comments come OLDEST-FIRST — the
+          # previous first-match break aged the OLDEST alert (dedupe never
+          # fired). Scan ALL marker comments and dedupe on the NEWEST.
+          newest = None
+          for c in comments:
+              if marker in c.get("body", ""):
+                  created = datetime.datetime.strptime(
+                      c["created_at"], "%Y-%m-%dT%H:%M:%SZ"
+                  ).replace(tzinfo=datetime.timezone.utc)
+                  if newest is None or created > newest:
+                      newest = created
+          if newest is not None:
+              age_h = (datetime.datetime.now(datetime.timezone.utc) - newest).total_seconds() / 3600
+              if age_h < DEDUPE_H:
+                  print(f"alert deduped (newest {marker} comment {age_h:.1f}h old < {DEDUPE_H}h)")
+                  sys.exit(0)
+
+          try:
+              now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+              api(
+                  f"https://api.github.com/gists/{gist}/comments",
+                  {
+                      "body": (
+                          f"{marker} {now} RED RUN — kill-dog sweep failed. Logs: {run_url} "
+                          "(the GPU spend watchdog is DOWN — orphaned RunPod pods may bill unbounded)"
+                      )
+                  },
+              )
+              print("alert comment posted")
+          except Exception as e:
+              print(f"::warning::alert comment post failed: {e}")
+          ALERTEOF
