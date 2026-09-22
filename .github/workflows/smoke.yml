@@ -1,0 +1,98 @@
+name: Runner smoke test
+
+# Connectivity self-test for this compute runner — validates everything
+# the scheduled workflows depend on, WITHOUT running the pipeline:
+#   1. Secrets are present (values never printed)
+#   2. PAT can check out the PRIVATE code repo
+#   3. Gist state roundtrip (read the kill-dog state channel)
+#   4. RunPod API authenticates (get_user)
+# Fires on every push to this repo (so workflow-file changes are
+# verified before they can break a schedule) and on manual dispatch.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: smoke-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    name: Connectivity smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check secrets are present
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          KILLDOG_GIST_ID: ${{ secrets.KILLDOG_GIST_ID }}
+        run: |
+          set -euo pipefail
+          for name in GH_PAT RUNPOD_API_KEY KILLDOG_GIST_ID; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Secret $name is not set."
+              exit 1
+            fi
+            echo "secret $name: present (value redacted)"
+          done
+
+      - name: Check out code repo (private, via PAT)
+        uses: actions/checkout@v4
+        with:
+          repository: beulahkemp/comfyui_backend
+          token: ${{ secrets.GH_PAT }}
+          path: backend
+
+      - name: Verify code checkout
+        run: |
+          set -euo pipefail
+          test -f backend/mvp-app/package.json || { echo "FATAL: code checkout incomplete"; exit 1; }
+          test -f backend/scripts/kill_dog.py || { echo "FATAL: kill_dog.py missing"; exit 1; }
+          echo "Code repo OK at $(git -C backend rev-parse HEAD)"
+
+      - name: Gist state roundtrip (kill-dog channel)
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          KILLDOG_GIST_ID: ${{ secrets.KILLDOG_GIST_ID }}
+        run: |
+          set -euo pipefail
+          python3 - << 'PYEOF'
+          import json
+          import os
+          import sys
+          import urllib.request
+
+          req = urllib.request.Request(
+              f"https://api.github.com/gists/{os.environ['KILLDOG_GIST_ID']}",
+              headers={"Authorization": f"token {os.environ['GH_PAT']}",
+                       "User-Agent": "sync-runner"})
+          with urllib.request.urlopen(req, timeout=30) as resp:
+              gist = json.loads(resp.read().decode())
+          content = (gist.get("files") or {}).get("state.json", {}).get("content")
+          if content is None:
+              print("FATAL: gist has no state.json file")
+              sys.exit(1)
+          state = json.loads(content)
+          print(f"Gist roundtrip OK (v={state.get('v')}, armed={state.get('armed')})")
+          PYEOF
+
+      - name: RunPod auth ping
+        working-directory: backend
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+        run: |
+          set -euo pipefail
+          python3 -m pip install --user -q -r requirements.txt
+          python3 - << 'PYEOF'
+          import sys
+          sys.path.insert(0, ".")
+          from src.runpod_client import RunPodClient
+
+          user = RunPodClient().get_user()
+          print(f"RunPod auth OK (user id: {user.get('id')})")
+          PYEOF
