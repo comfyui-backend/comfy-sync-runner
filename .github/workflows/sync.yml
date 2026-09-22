@@ -1,0 +1,373 @@
+name: scheduled-sync
+
+# Hourly headless pricing data refresh for the PRIVATE repo
+# beulahkemp/comfyui_backend (wave-13 adhoc-1 — see RUNBOOK §Org runner
+# in that repo). This PUBLIC repo is compute-only: unlimited Actions
+# minutes; all code + data live in the private repo, checked out via
+# the GH_PAT secret; nothing sensitive is ever committed here.
+#
+# Pipeline: checkout private → npm ci + prisma db push →
+# npx tsx scripts/run-scheduled-sync.ts (seed → history replay →
+# web3 listings → channels + persist; JSON guards; exit codes) →
+# race-safe commit of the two data files ([skip ci]) → daily
+# state/last-run.json keep-alive commit (resets GHA's 60-day
+# schedule-inactivity timer + public observability).
+#
+# Secrets: GH_PAT (private checkout + push), RUNPOD_API_KEY +
+# REPLICATE_API_TOKEN (injected as env below — wave-17 E-01: the backend's
+# tracked .env now carries placeholders only; channel credentials live
+# HERE as runner-repo secrets).
+# Never `echo` any secret; GitHub auto-redacts registered values.
+#
+# ─── Cadence design (wave-14 B0.1 densifier) ──────────────────
+# GitHub's scheduler DROPS ~2 of 3 scheduled runs under platform load
+# (observed 2026-09-06: 4 runs across 10 hourly slots). Two mechanisms
+# guarantee hourly coverage:
+#   1. Self-chain (primary): on SUCCESS this workflow sleeps until the
+#      next :07 boundary and dispatches its own successor via
+#      workflow_dispatch (dispatch runs are never dropped). The chain
+#      breaks only on failure — visible as a red run.
+#   2. Cron backstops (secondary): TWO hourly slots (:07 and :47) catch
+#      a broken chain with ~40% each per slot → expected recovery ≤1h.
+# The concurrency group serializes everything; the chain only ever
+# queues ONE successor (no backlog growth). Reversible: set runner-repo
+# variable SYNC_SELF_CHAIN=off to disable the chain (crons still run).
+
+on:
+  schedule:
+    # Backstop slots — off the top of the hour (GitHub's :00 cron load
+    # makes delays/drops worse there; repo convention). :07 mirrors the
+    # chain target; :47 halves the broken-chain recovery gap.
+    - cron: '7 * * * *'
+    - cron: '47 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Run the sync but skip the data/state commits'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+
+permissions: {}
+# No pull_request trigger — fork PRs can never access secrets.
+
+concurrency:
+  group: scheduled-sync
+  cancel-in-progress: false # never kill a mid-flight sync
+
+jobs:
+  sync:
+    name: Pricing data refresh
+    runs-on: ubuntu-latest
+    timeout-minutes: 70  # sync (~8min) + self-chain sleep (≤55min) + margin
+    steps:
+      - name: Check configuration
+        env:
+          HAS_PAT: ${{ secrets.GH_PAT != '' }}
+        run: |
+          if [ "$HAS_PAT" != "true" ]; then
+            echo "::error::GH_PAT secret not configured on this repo."
+            exit 1
+          fi
+
+      - name: Check out private backend repo
+        uses: actions/checkout@v4
+        with:
+          repository: beulahkemp/comfyui_backend
+          token: ${{ secrets.GH_PAT }}
+          path: backend
+          # Full history: the race-safe push rebases the data commit.
+          fetch-depth: 0
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: backend/mvp-app/package-lock.json
+
+      - name: Install deps + prepare ephemeral DB
+        working-directory: backend/mvp-app
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          # db push creates the SQLite file + generates the Prisma client
+          # (DATABASE_URL comes from the checked-out .env; the file is
+          # ephemeral — git is the disk).
+          npx prisma db push
+
+      - name: Run scheduled sync (seed → replay → listings → channels)
+        working-directory: backend/mvp-app
+        env:
+          DATABASE_URL: file:./db/custom.db
+          # Wave-17 audit E-01: provider keys come from RUNNER SECRETS, not
+          # the tracked .env (run-scheduled-sync loads .env WITHOUT
+          # overriding existing env — explicit env wins; the tracked file
+          # now carries placeholders only). kill-dog.yml already used this
+          # pattern for its RunPod key.
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          REPLICATE_API_TOKEN: ${{ secrets.REPLICATE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          npx tsx scripts/run-scheduled-sync.ts
+
+      - name: Commit data refresh (race-safe, [skip ci])
+        if: ${{ inputs.dry_run != 'true' }}
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          git config user.name "beulahkemp"
+          git config user.email "223220792+beulahkemp@users.noreply.github.com"
+          git add mvp-app/src/data/model-catalog.json
+          # F6 (wave-19): the history durable plane is the SHARD STORE
+          # (src/data/price-history/<YYYY-MM>.jsonl + manifest.json).
+          # The legacy single-file line stages the file when it exists OR
+          # its DELETION when it is still tracked (the migration/fold just
+          # consumed it this cycle). HOTFIX 2026-09-16: the unconditional
+          # form died with "pathspec did not match any files" on the first
+          # post-F6 fresh checkout (the file is gone from HEAD — run
+          # 35046731009, exit 128) — the ls-files guard covers all three
+          # states: present / tracked-but-deleted / absent.
+          if [ -e mvp-app/src/data/price-history.jsonl ] || git ls-files --error-unmatch mvp-app/src/data/price-history.jsonl >/dev/null 2>&1; then
+            git add mvp-app/src/data/price-history.jsonl
+          else
+            echo "Legacy price-history.jsonl absent and untracked (steady post-F6 state) — nothing to stage for it."
+          fi
+          if [ -d mvp-app/src/data/price-history ]; then
+            git add mvp-app/src/data/price-history/
+          else
+            echo "No shard dir (pre-F6 checkout) — skipping shard staging."
+          fi
+          if git diff --cached --quiet; then
+            echo "No data changes this run — nothing to commit."
+            exit 0
+          fi
+          git commit -m "data(pricing): scheduled sync $(date -u +%Y-%m-%dT%H:%M:%SZ) [skip ci]"
+          # Race-safe push: a parallel session may have pushed to main
+          # mid-run. Rebase the data-only commit on top and retry. NEVER
+          # force-push; a failed push leaves the run red and the next
+          # hourly run re-syncs (git objects hold the data).
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              echo "Data commit pushed (attempt $attempt)."
+              exit 0
+            fi
+            echo "Push rejected (attempt $attempt) — rebasing on origin/main and retrying."
+            git fetch origin main
+            git rebase origin/main
+            sleep $((attempt * 5))
+          done
+          echo "::error::data push failed after 3 attempts — a parallel session likely pushed; next hourly run re-syncs."
+          exit 1
+
+      - name: Keep runner repo schedulable (daily state commit)
+        if: ${{ inputs.dry_run != 'true' }}
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          RUNNER_REPO: comfyui-backend/comfy-sync-runner
+        run: |
+          set -euo pipefail
+          today="$(date -u +%F)"
+          export TODAY="$today"
+          python3 - << 'PYEOF'
+          import base64
+          import json
+          import os
+          import urllib.request
+
+          pat = os.environ["GH_PAT"]
+          repo = os.environ["RUNNER_REPO"]
+          today = os.environ["TODAY"]
+          api = f"https://api.github.com/repos/{repo}/contents/state/last-run.json"
+
+          req = urllib.request.Request(api, headers={"Authorization": f"token {pat}",
+                                                    "User-Agent": "sync-runner"})
+          sha = ""
+          existing_date = ""
+          try:
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  d = json.loads(resp.read().decode())
+              sha = d.get("sha", "")
+              content = base64.b64decode(d.get("content", "")).decode()
+              existing_date = json.loads(content).get("date", "")
+          except Exception:
+              pass  # 404 on first run — create mode
+
+          if existing_date == today:
+              print(f"state/last-run.json already records {today} — skipping.")
+              raise SystemExit(0)
+
+          payload = {
+              "date": today,
+              "purpose": "keeps GHA schedules alive (60-day inactivity rule) + public observability",
+          }
+          body = {"message": f"state: sync ran on {today}",
+                  "content": base64.b64encode(json.dumps(payload, indent=2).encode()).decode()}
+          if sha:
+              body["sha"] = sha
+          req = urllib.request.Request(api, data=json.dumps(body).encode(), method="PUT",
+                                      headers={"Authorization": f"token {pat}",
+                                               "Content-Type": "application/json",
+                                               "User-Agent": "sync-runner"})
+          with urllib.request.urlopen(req, timeout=30) as resp:
+              code = resp.status
+          print(f"state/last-run.json committed for {today} (HTTP {code}).")
+          PYEOF
+
+      - name: "Self-chain (schedule the next hourly run)"
+        # B0.1 densifier (see header). Only chains on SUCCESS — a failed
+        # sync must not propagate the loop (the red run is the alert; the
+        # :07/:47 cron backstops catch up). Disabled via runner-repo
+        # variable SYNC_SELF_CHAIN=off.
+        if: ${{ success() && inputs.dry_run != 'true' && vars.SYNC_SELF_CHAIN != 'off' }}
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          RUNNER_REPO: comfyui-backend/comfy-sync-runner
+        run: |
+          set -euo pipefail
+          python3 - << 'PYEOF'
+          import datetime
+          import json
+          import os
+          import time
+          import urllib.request
+
+          repo = os.environ["RUNNER_REPO"]
+          pat = os.environ["GH_PAT"]
+
+          now = datetime.datetime.now(datetime.timezone.utc)
+          target = now.replace(minute=7, second=0, microsecond=0)
+          if target <= now:
+              target += datetime.timedelta(hours=1)
+          sleep_s = int((target - now).total_seconds())
+          if sleep_s > 3300:  # cap 55 min; never approach the 70-min timeout
+              sleep_s = 3300
+          print(f"::notice::self-chain sleeping {sleep_s}s until {target.isoformat()}Z, then dispatching the successor run.")
+          time.sleep(sleep_s)
+
+          api = f"https://api.github.com/repos/{repo}/actions/workflows/sync.yml/dispatches"
+          req = urllib.request.Request(
+              api,
+              data=json.dumps({"ref": "main"}).encode(),
+              method="POST",
+              headers={
+                  "Authorization": f"token {pat}",
+                  "Accept": "application/vnd.github+json",
+                  "Content-Type": "application/json",
+                  "User-Agent": "sync-runner",
+              },
+          )
+          # Wave-18: GitHub's dispatch API can 5xx transiently (observed
+          # run 383, 2026-09-13T09:03Z — a single HTTP 500 killed the
+          # chain; recovery fell to the ~2/3-dropped cron backstops).
+          # Retry up to 3 attempts with backoff; a final failure still
+          # goes red (alert) and the cron backstops remain the net.
+          import urllib.error
+          last_err = None
+          for attempt in range(1, 4):
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as resp:
+                      print(f"Successor dispatched (HTTP {resp.status}, attempt {attempt}). Chain continues.")
+                  last_err = None
+                  break
+              except urllib.error.HTTPError as e:
+                  if 500 <= e.code < 600 and attempt < 3:
+                      wait = 10 * attempt
+                      print(f"::warning::dispatch attempt {attempt} got HTTP {e.code}; retrying in {wait}s.")
+                      time.sleep(wait)
+                      req = urllib.request.Request(
+                          api,
+                          data=json.dumps({"ref": "main"}).encode(),
+                          method="POST",
+                          headers={
+                              "Authorization": f"token {pat}",
+                              "Accept": "application/vnd.github+json",
+                              "Content-Type": "application/json",
+                              "User-Agent": "sync-runner",
+                          },
+                      )
+                      last_err = e
+                      continue
+                  raise
+          if last_err is not None:
+              raise last_err
+          PYEOF
+
+      - name: "Alert on failure (gist comment, 6h-deduped)"
+        # Wave-17 audit E-02: a red run was previously its own only signal —
+        # nobody is paged. Persistent red = the data plane is down; if the
+        # kill-dog is ALSO red, orphaned pods bill unbounded while silent.
+        # Posts an audit COMMENT to the shared ops gist (never rewrites the
+        # kill-dog state file — comments are the append-only channel).
+        # Deduped: at most one [alert:sync] comment per 6h. Best-effort:
+        # alert failures never fail the run further.
+        if: ${{ failure() }}
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GIST_ID: ${{ secrets.KILLDOG_GIST_ID }}
+          ALERT_MARKER: "[alert:sync]"
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python3 - << 'ALERTEOF'
+          import datetime
+          import json
+          import os
+          import sys
+          import urllib.request
+
+          pat = os.environ["GH_PAT"]
+          gist = os.environ["GIST_ID"]
+          marker = os.environ["ALERT_MARKER"]
+          run_url = os.environ["RUN_URL"]
+          DEDUPE_H = 6
+
+          def api(url, data=None):
+              req = urllib.request.Request(
+                  url,
+                  headers={"Authorization": f"token {pat}", "User-Agent": "sync-runner-alert"},
+                  data=json.dumps(data).encode() if data is not None else None,
+              )
+              with urllib.request.urlopen(req, timeout=20) as r:
+                  return json.loads(r.read().decode() or "{}")
+
+          try:
+              comments = api(f"https://api.github.com/gists/{gist}/comments?per_page=10")
+          except Exception as e:
+              print(f"::warning::alert step could not read gist comments: {e}")
+              sys.exit(0)
+
+          # Wave-17 verify round1: gist comments come OLDEST-FIRST — the
+          # previous first-match break aged the OLDEST alert (dedupe never
+          # fired). Scan ALL marker comments and dedupe on the NEWEST.
+          newest = None
+          for c in comments:
+              if marker in c.get("body", ""):
+                  created = datetime.datetime.strptime(
+                      c["created_at"], "%Y-%m-%dT%H:%M:%SZ"
+                  ).replace(tzinfo=datetime.timezone.utc)
+                  if newest is None or created > newest:
+                      newest = created
+          if newest is not None:
+              age_h = (datetime.datetime.now(datetime.timezone.utc) - newest).total_seconds() / 3600
+              if age_h < DEDUPE_H:
+                  print(f"alert deduped (newest {marker} comment {age_h:.1f}h old < {DEDUPE_H}h)")
+                  sys.exit(0)
+
+          try:
+              now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+              api(
+                  f"https://api.github.com/gists/{gist}/comments",
+                  {
+                      "body": (
+                          f"{marker} {now} RED RUN — sync pipeline failed. Logs: {run_url} "
+                          "(persistent red = data plane down; if [alert:kill-dog] is also recent, "
+                          "orphaned pods bill unbounded)"
+                      )
+                  },
+              )
+              print("alert comment posted")
+          except Exception as e:
+              print(f"::warning::alert comment post failed: {e}")
+          ALERTEOF
