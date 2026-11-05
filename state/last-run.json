@@ -1,4 +1,4 @@
 {
-  "date": "2026-11-04",
+  "date": "2026-11-05",
   "purpose": "keeps GHA schedules alive (60-day inactivity rule) + public observability"
 }
